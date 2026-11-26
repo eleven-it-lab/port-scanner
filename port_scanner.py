@@ -10,20 +10,64 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 KNOWN_PORTS = {
+    # Core & Legacy Management
+    20: "FTP-Data",
     21: "FTP",
     22: "SSH",
     23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
     80: "HTTP / WebFig",
+    110: "POP3",
+    143: "IMAP",
     179: "BGP",
+    389: "LDAP",
     443: "HTTPS / WebFig-SSL",
+    445: "SMB / Windows File Share",
+    465: "SMTPS",
+    514: "Syslog (TCP) / RSH",
+    587: "SMTP Submission",
+    636: "LDAPS",
+    873: "rsync",
     888: "HTTP / WebFig (Alt)",
+    993: "IMAPS",
+    995: "POP3S",
+
+    # VPN & Tunneling (TCP)
+    1194: "OpenVPN",
+    1723: "PPTP VPN",
+    8443: "HTTPS (Alt) / Web Management",
+
+    # MikroTik RouterOS & ISP Specific
     2000: "MikroTik Bandwidth Test",
+    8080: "HTTP Proxy / Alt Web",
+    8081: "HTTP (Alt) / OLT Web",
     8291: "Winbox (Default)",
     8728: "RouterOS API",
     8729: "RouterOS API-SSL",
+
+    # OLT / TR-069 / CWMP & ISP Provisioning
+    7547: "TR-069 / CWMP (ACS)",
+    9090: "Web Console / Cockpit / Alt Web",
+    9100: "Raw Print / JetDirect",
+
+    # Linux, Databases & NMS / Monitoring
+    3000: "Grafana / Dev Web",
+    3306: "MySQL / MariaDB",
+    3389: "RDP (Windows Remote Desktop)",
+    5000: "UPnP / Flask / Dev Web",
+    5432: "PostgreSQL",
+    5900: "VNC Remote Desktop",
+    6379: "Redis",
+    8000: "Django / Dev HTTP",
+    8086: "InfluxDB",
+    9000: "Portainer / SonarQube / PHP-FPM",
+    9200: "Elasticsearch",
+    10050: "Zabbix Agent",
+    10051: "Zabbix Server / Trapper",
 }
 
-CANARY_PORTS = [22, 80, 443, 2000, 8291, 8728]
+CANARY_PORTS = [22, 23, 80, 443, 179, 2000, 8080, 8291, 8728]
 
 
 def is_host_alive(ip_str, timeout=0.35):
@@ -53,7 +97,7 @@ def check_target(ip_str, port, timeout=0.4):
         if s.connect_ex((ip_str, port)) != 0:
             return None
 
-        label = KNOWN_PORTS.get(port, "Custom / Winbox Candidate")
+        label = KNOWN_PORTS.get(port, "Custom Port")
         try:
             s.settimeout(0.3)
             banner = s.recv(256)
