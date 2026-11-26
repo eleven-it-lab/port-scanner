@@ -1,4 +1,14 @@
+# Python bytecode & cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Local scratch scripts & virtual environments
 practice.py
+.venv/
+venv/
+
+# Sensitive network target lists & scan reports
+targets.txt
+*.csv
 *.log
