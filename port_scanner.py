@@ -32,11 +32,9 @@ def is_host_alive(ip_str, timeout=0.35):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             code = s.connect_ex((ip_str, port))
-            # 0 = OPEN (SYN-ACK), 10061 (Win) / 111 (Linux) = CLOSED (RST -> host is UP!)
-            if code in (0, 10061, 111):
+            if code in (0, 10061, 111):  # 0=OPEN, 10061/111=RST (host stack is alive)
                 return ip_str
 
-    # Fallback ICMP ping (1 packet, 300ms wait) in case firewall drops all canary ports
     param = "-n" if sys.platform.startswith("win") else "-c"
     wait_flag = "-w" if sys.platform.startswith("win") else "-W"
     wait_val = "300" if sys.platform.startswith("win") else "1"
@@ -82,36 +80,84 @@ def parse_ports(port_arg):
     return sorted(ports)
 
 
-def scan_subnet(cidr, ports, workers=200, timeout=0.4, discover_first=False, csv_file=None):
-    try:
-        network = ipaddress.ip_network(cidr, strict=False)
-    except ValueError as e:
-        print(f"[!] Invalid CIDR subnet '{cidr}': {e}")
+def extract_positional_ports(positional_args):
+    """Separates target IPs/CIDRs from optional trailing <start_port> <end_port> or <single_port>."""
+    if len(positional_args) >= 3 and positional_args[-2].isdigit() and positional_args[-1].isdigit():
+        start_p, end_p = int(positional_args[-2]), int(positional_args[-1])
+        if 1 <= start_p <= end_p <= 65535:
+            return positional_args[:-2], start_p, end_p
+
+    if len(positional_args) >= 2 and positional_args[-1].isdigit():
+        single_p = int(positional_args[-1])
+        if 1 <= single_p <= 65535:
+            return positional_args[:-1], single_p, single_p
+
+    return positional_args, None, None
+
+
+def expand_targets(target_tokens, file_path=None):
+    """Expands single IPs, CIDR subnets, and target files into a deduplicated IP list."""
+    raw_items = list(target_tokens)
+
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    clean = line.split("#", 1)[0].strip()
+                    if clean:
+                        raw_items.extend(clean.replace(",", " ").split())
+        except FileNotFoundError:
+            print(f"[!] Target file not found: {file_path}")
+            sys.exit(1)
+
+    ips = []
+    seen = set()
+
+    for token in raw_items:
+        try:
+            if "/" in token:
+                net = ipaddress.ip_network(token, strict=False)
+                if net.num_addresses > 4096:
+                    print(f"[!] Safety stop: {token} contains {net.num_addresses} IPs (/20 max).")
+                    sys.exit(1)
+                for host in net.hosts():
+                    ip_str = str(host)
+                    if ip_str not in seen:
+                        seen.add(ip_str)
+                        ips.append(ip_str)
+            else:
+                ip_str = str(ipaddress.ip_address(token))
+                if ip_str not in seen:
+                    seen.add(ip_str)
+                    ips.append(ip_str)
+        except ValueError:
+            print(f"[!] Invalid IP or CIDR target: '{token}'")
+            sys.exit(1)
+
+    return ips
+
+
+def run_scan(target_ips, ports, workers=200, timeout=0.4, csv_file=None):
+    if not target_ips:
+        print("[!] No valid targets provided. Pass IP(s), CIDR(s), or -f <file>.")
         return
 
-    if network.num_addresses > 4096:
-        print(f"[!] Safety stop: {cidr} contains {network.num_addresses} IPs (/20 max recommended).")
-        return
-
-    all_hosts = [str(ip) for ip in network.hosts()]
     start_time = time.time()
 
-    # Stage 1: Filter out dead IPs before heavy port sweeps (10k / 65k)
-    if discover_first:
-        print(f"[*] Stage 1: Discovering live hosts in {cidr} ({len(all_hosts)} IPs)...")
-        with ThreadPoolExecutor(max_workers=100) as executor:
-            alive_hosts = [h for h in executor.map(is_host_alive, all_hosts) if h]
-        alive_hosts.sort(key=lambda ip: tuple(int(o) for o in ip.split(".")))
-        print(f"[+] Found {len(alive_hosts)} active hosts in {time.time() - start_time:.2f}s.\n")
+    # Auto-enable Stage 1 host discovery only for multi-host sweeps > 50 ports
+    if len(target_ips) > 1 and len(ports) > 50:
+        print(f"[*] Stage 1: Checking liveness across {len(target_ips)} hosts...")
+        with ThreadPoolExecutor(max_workers=min(100, len(target_ips))) as executor:
+            alive_hosts = [h for h in executor.map(is_host_alive, target_ips) if h]
+        print(f"[+] {len(alive_hosts)}/{len(target_ips)} hosts active in {time.time() - start_time:.2f}s.\n")
         if not alive_hosts:
             return
     else:
-        alive_hosts = all_hosts
+        alive_hosts = target_ips
 
-    # Stage 2: Port scan across active hosts
     tasks = [(ip, port) for ip in alive_hosts for port in ports]
     total_tasks = len(tasks)
-    print(f"[*] Scanning {len(alive_hosts)} hosts x {len(ports)} ports = {total_tasks} checks...")
+    print(f"[*] Scanning {len(alive_hosts)} host(s) x {len(ports)} port(s) = {total_tasks} checks...")
 
     scan_start = time.time()
     completed = 0
@@ -141,9 +187,11 @@ def scan_subnet(cidr, ports, workers=200, timeout=0.4, discover_first=False, csv
                 sys.stdout.flush()
 
     sys.stdout.write("\r" + " " * 80 + "\r")
-    print(f"\n[*] Completed in {time.time() - start_time:.2f}s. Grouped Summary:")
+    print(f"\n[*] Completed in {time.time() - start_time:.2f}s. Summary:")
 
     sorted_ips = sorted(grouped_results.keys(), key=lambda ip: tuple(int(o) for o in ip.split(".")))
+    if not sorted_ips:
+        print("    No open ports found.")
     for ip_str in sorted_ips:
         ports_str = ", ".join(f"{p} ({lbl})" for p, lbl in sorted(grouped_results[ip_str]))
         print(f"    {ip_str:<15} -> {ports_str}")
@@ -160,31 +208,27 @@ def scan_subnet(cidr, ports, workers=200, timeout=0.4, discover_first=False, csv
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Subnet TCP Port Scanner for MikroTik / ISP Management")
-    parser.add_argument("cidr", help="Target subnet in CIDR notation (e.g., 192.0.2.0/24)")
-    parser.add_argument("-p", "--ports", default="22,80,443,8291,8728", help="Ports or ranges (e.g., 22,8291 or 1-10000)")
-    parser.add_argument("--top10k", action="store_true", help="Auto-discover live hosts first, then scan ports 1-10000")
-    parser.add_argument("--full", action="store_true", help="Auto-discover live hosts first, then scan all 65535 ports")
+    parser = argparse.ArgumentParser(description="Unified TCP Port Scanner (Single IP, CIDR, or Multi-IP)")
+    parser.add_argument("args", nargs="*", help="Target IP(s)/CIDR(s) optionally followed by <start_port> <end_port>")
+    parser.add_argument("-f", "--file", metavar="FILE", help="Text file containing target IPs or CIDRs")
+    parser.add_argument("-p", "--ports", default="22,80,443,8291,8728", help="Comma/range ports (default: 22,80,443,8291,8728)")
+    parser.add_argument("--top10k", action="store_true", help="Scan ports 1-10000")
+    parser.add_argument("--full", action="store_true", help="Scan all 65535 TCP ports")
     parser.add_argument("--workers", type=int, default=200, help="Concurrent threads (default: 200)")
     parser.add_argument("--timeout", type=float, default=0.4, help="Socket timeout in seconds (default: 0.4)")
-    parser.add_argument("--csv", metavar="FILE", help="Export scan results to a CSV file (e.g., audit.csv)")
-    args = parser.parse_args()
+    parser.add_argument("--csv", metavar="FILE", help="Export scan results to CSV")
+    cli = parser.parse_args()
 
-    if args.full:
-        target_ports = list(range(1, 65536))
-        discover = True
-    elif args.top10k:
-        target_ports = list(range(1, 10001))
-        discover = True
+    target_tokens, start_port, end_port = extract_positional_ports(cli.args)
+    targets = expand_targets(target_tokens, file_path=cli.file)
+
+    if cli.full:
+        ports_to_scan = list(range(1, 65536))
+    elif cli.top10k:
+        ports_to_scan = list(range(1, 10001))
+    elif start_port is not None and end_port is not None:
+        ports_to_scan = list(range(start_port, end_port + 1))
     else:
-        target_ports = parse_ports(args.ports)
-        discover = len(target_ports) > 50
+        ports_to_scan = parse_ports(cli.ports)
 
-    scan_subnet(
-        args.cidr,
-        target_ports,
-        workers=args.workers,
-        timeout=args.timeout,
-        discover_first=discover,
-        csv_file=args.csv,
-    )
+    run_scan(targets, ports_to_scan, workers=cli.workers, timeout=cli.timeout, csv_file=cli.csv)
